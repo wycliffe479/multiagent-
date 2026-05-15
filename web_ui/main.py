@@ -250,67 +250,79 @@ async def run_pipeline(request: Request):
 
 def _invoke_pipeline(raw_alert: str) -> dict[str, Any]:
     """Synchronous pipeline invocation (runs in thread pool)."""
-    import importlib.util
+    import io
 
-    def load_wf(rel):
-        abs_path   = os.path.join(_ROOT, rel)
-        # rel example: "group-a-agents/src/workflow/graph.py"
-        if "group-a-agents" in abs_path:
-            group_root = os.path.join(_ROOT, "group-a-agents")
-        elif "group-b-agents" in abs_path:
-            group_root = os.path.join(_ROOT, "group-b-agents")
-        else:
-            raise RuntimeError(f"Cannot determine group for: {abs_path}")
+    # Capture all print() output from agents
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
 
-        src_dir = os.path.join(group_root, "src")
+    try:
+        def load_wf(rel):
+            abs_path = os.path.join(_ROOT, rel)
+            if "group-a-agents" in abs_path:
+                group_root = os.path.join(_ROOT, "group-a-agents")
+            elif "group-b-agents" in abs_path:
+                group_root = os.path.join(_ROOT, "group-b-agents")
+            else:
+                raise RuntimeError(f"Cannot determine group for: {abs_path}")
 
-        # Ensure the correct group's `src/` is importable as top-level package `src`.
-        old_sys_path = sys.path[:]
-        try:
-            # Remove other group's src dirs to prevent `src` collisions.
-            other_a = os.path.join(_ROOT, "group-a-agents", "src")
-            other_b = os.path.join(_ROOT, "group-b-agents", "src")
-            sys.path[:] = [p for p in sys.path if p not in (other_a, other_b)]
+            src_dir = os.path.join(group_root, "src")
+            # Clear cached src modules to prevent stale state bleeding across runs
+            for k in list(sys.modules.keys()):
+                if k == "src" or k.startswith("src."):
+                    sys.modules.pop(k, None)
 
-            if _ROOT not in sys.path:
-                sys.path.insert(0, _ROOT)
-            if group_root not in sys.path:
-                sys.path.insert(0, group_root)
-            if src_dir not in sys.path:
-                sys.path.insert(0, src_dir)
+            old_sys_path = sys.path[:]
+            try:
+                other_a = os.path.join(_ROOT, "group-a-agents", "src")
+                other_b = os.path.join(_ROOT, "group-b-agents", "src")
+                sys.path[:] = [p for p in sys.path if p not in (other_a, other_b)]
 
-            module = __import__("src.workflow.graph", fromlist=["workflow"])
-            return getattr(module, "workflow")
-        finally:
-            sys.path[:] = old_sys_path
+                if _ROOT not in sys.path:
+                    sys.path.insert(0, _ROOT)
+                if group_root not in sys.path:
+                    sys.path.insert(0, group_root)
+                if src_dir not in sys.path:
+                    sys.path.insert(0, src_dir)
 
+                module = __import__("src.workflow.graph", fromlist=["workflow"])
+                return getattr(module, "workflow")
+            finally:
+                sys.path[:] = old_sys_path
 
-    wf_a = load_wf("group-a-agents/src/workflow/graph.py")
-    state_a = wf_a.invoke({
-        "raw_alert":       raw_alert,
-        "parsed_alert":    {},
-        "past_incidents":  [],
-        "recommended_fix": "",
-        "reasoning":       "",
-        "status":          "",
-    })
+        wf_a = load_wf("group-a-agents/src/workflow/graph.py")
+        state_a = wf_a.invoke({
+            "raw_alert":       raw_alert,
+            "parsed_alert":    {},
+            "past_incidents":  [],
+            "recommended_fix": "",
+            "reasoning":       "",
+            "status":          "",
+        })
 
-    wf_b = load_wf("group-b-agents/src/workflow/graph.py")
-    state_b = wf_b.invoke({
-        "parsed_alert":    state_a.get("parsed_alert",    {}),
-        "past_incidents":  state_a.get("past_incidents",  []),
-        "recommended_fix": state_a.get("recommended_fix", "monitor"),
-        "reasoning":       state_a.get("reasoning",       ""),
-        "decision":        {},
-        "slack_message":   "",
-        "slack_status":    "",
-        "status":          "",
-    })
+        wf_b = load_wf("group-b-agents/src/workflow/graph.py")
+        state_b = wf_b.invoke({
+            "parsed_alert":    state_a.get("parsed_alert",    {}),
+            "past_incidents":  state_a.get("past_incidents",  []),
+            "recommended_fix": state_a.get("recommended_fix", "monitor"),
+            "reasoning":       state_a.get("reasoning",       ""),
+            "decision":        {},
+            "slack_message":   "",
+            "slack_status":    "",
+            "status":          "",
+        })
 
-    return {**state_a, **state_b}
+    finally:
+        sys.stdout = old_stdout
+
+    # Turn captured stdout into a list of log lines
+    logs = [line for line in captured.getvalue().splitlines() if line.strip()]
+
+    return {**state_a, **state_b, "logs": logs}
 
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("Starting Anvil 2026 Web UI at http://localhost:8000")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, app_dir=os.path.dirname(__file__))
+    uvicorn.run("main:app", host="0.0.0.0", port=8010, reload=False, app_dir=os.path.dirname(__file__))
