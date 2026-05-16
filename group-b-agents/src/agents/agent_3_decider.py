@@ -7,42 +7,68 @@ AGENT 3: Decision Maker
 import json
 import sys
 import os
+from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from openai import OpenAI
-from src.config import OPENCODE_API_KEY, OPENCODE_BASE_URL, MODEL_NAME
 
-llm = OpenAI(api_key=OPENCODE_API_KEY, base_url=OPENCODE_BASE_URL)
 
-_SYSTEM = "You are an SRE decision engine. Return ONLY valid JSON with no markdown fences."
+def _get_llm():
+    from src.config import OPENCODE_API_KEY, OPENCODE_BASE_URL, MODEL_NAME
+    return OpenAI(api_key=OPENCODE_API_KEY, base_url=OPENCODE_BASE_URL), MODEL_NAME
 
-_PROMPT = """You must decide the final remediation action for this incident.
+_SYSTEM = "You are a senior SRE decision engine. Think step by step before deciding."
 
-CURRENT ALERT:
+_DECOMPOSE_PROMPT = """Analyze this incident and break it down:
+
+ALERT:
   Server   : {server_name}
   Error    : {error_type}
   Severity : {severity}
   Location : {location}
+  Recommended fix (from history/web): {recommended_fix}
+  Past incidents: {past_incidents}
 
-RECOMMENDED FIX (from historical data / LLM search):
-  {recommended_fix}
+Answer these 3 questions in plain text:
+1. ROOT CAUSE: What is most likely causing this error?
+2. BLAST RADIUS: What systems/users are affected and how badly?
+3. OPTIONS: List 2-3 possible remediation actions with one-line pros/cons each."""
 
-PAST INCIDENTS (most recent first):
-{past_incidents}
+_PLAN_PROMPT = """Given this incident analysis:
+{decomposition}
 
-Decision rules:
-  • severity = critical  AND known fix exists  → auto-execute the fix
-  • severity = critical  AND no known fix      → escalate to human
-  • severity = warning                         → auto-fix if confidence > 0.8, else monitor
-  • severity = info                            → monitor / log only
+And these decision rules:
+  • severity=critical AND known fix exists → auto-execute the fix
+  • severity=critical AND no known fix    → escalate to human
+  • severity=warning                      → auto-fix if confidence > 0.8, else monitor
+  • severity=info                         → monitor only
 
-Return ONLY a JSON object with these keys:
+Pick the single best action from:
+  restart_server | rollback | escalate | monitor | create_ticket | scale_up | restart_pods | clear_cache
+
+Respond in plain text:
+CHOSEN ACTION: <action>
+REASON: <one sentence>
+CONFIDENCE: <0.0-1.0>
+AUTO EXECUTE: <yes/no>
+RECOVERY MINUTES: <integer>"""
+
+_REFLECT_PROMPT = """You chose this plan:
+{plan}
+
+For this incident:
+  Server: {server_name} | Error: {error_type} | Severity: {severity}
+
+Critically review: Is this the safest, most effective action?
+If yes, confirm it. If not, correct it.
+
+Then return ONLY a JSON object (no markdown):
 {{
-  "action": "<one of: restart_server | rollback | escalate | monitor | create_ticket | scale_up | restart_pods | clear_cache>",
+  "action": "<action>",
   "auto_execute": <true|false>,
-  "reasoning": "<1–2 sentences explaining the choice>",
-  "confidence": <0.0–1.0>,
+  "reasoning": "<1-2 sentences combining your analysis and why this is the best choice>",
+  "confidence": <0.0-1.0>,
   "estimated_recovery_minutes": <integer>
 }}"""
 
@@ -91,7 +117,6 @@ def _validate_decision(raw: Any, fallback: dict) -> dict:
         action = "monitor"
 
     auto_execute = raw.get("auto_execute", fallback.get("auto_execute", False))
-    # Coerce to bool conservatively
     if isinstance(auto_execute, str):
         auto_execute = auto_execute.strip().lower() in {"true", "1", "yes"}
     else:
@@ -125,11 +150,9 @@ def agent_3_decide_action(state: dict) -> dict:
     past_incidents  = state.get("past_incidents", [])
     recommended_fix = state.get("recommended_fix", "monitor")
 
-
     server = parsed.get("server_name", "unknown")
     print(f"[Agent 3] Deciding action for server: {server}")
 
-    # Summarise past incidents compactly for the prompt
     past_summary = "\n".join(
         f"  - {inc.get('incident_id', inc.get('id', '?'))}: "
         f"error={inc.get('error_type', '?')}  fix={inc.get('fix_applied', inc.get('fix', '?'))}"
@@ -145,43 +168,73 @@ def agent_3_decide_action(state: dict) -> dict:
     }
 
     try:
-        response = llm.chat.completions.create(
+        llm, MODEL_NAME = _get_llm()
+
+        ctx = dict(
+            server_name     = parsed.get("server_name", "unknown"),
+            error_type      = parsed.get("error_type",  "unknown"),
+            severity        = parsed.get("severity",    "unknown"),
+            location        = parsed.get("location",    "unknown"),
+            recommended_fix = recommended_fix,
+            past_incidents  = past_summary,
+        )
+
+        # --- Step 1: Decompose ---
+        print(f"[Agent 3] Step 1/3 — Decomposing incident …")
+        r1 = llm.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": _SYSTEM},
-                {"role": "user",   "content": _PROMPT.format(
-                    server_name     = parsed.get("server_name", "unknown"),
-                    error_type      = parsed.get("error_type",  "unknown"),
-                    severity        = parsed.get("severity",    "unknown"),
-                    location        = parsed.get("location",    "unknown"),
-                    recommended_fix = recommended_fix,
-                    past_incidents  = past_summary,
-                )},
+                {"role": "user",   "content": _DECOMPOSE_PROMPT.format(**ctx)},
+            ],
+            temperature=0.2,
+        )
+        decomposition = r1.choices[0].message.content.strip()
+        print(f"[Agent 3] Decomposition:\n{decomposition}")
+
+        # --- Step 2: Plan ---
+        print(f"[Agent 3] Step 2/3 — Planning remediation …")
+        r2 = llm.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user",   "content": _PLAN_PROMPT.format(decomposition=decomposition)},
             ],
             temperature=0.1,
         )
+        plan = r2.choices[0].message.content.strip()
+        print(f"[Agent 3] Plan:\n{plan}")
 
-        content = _clean_json(response.choices[0].message.content)
+        # --- Step 3: Reflect & output JSON ---
+        print(f"[Agent 3] Step 3/3 — Reflecting and finalizing …")
+        r3 = llm.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user",   "content": _REFLECT_PROMPT.format(
+                    plan=plan,
+                    server_name=ctx["server_name"],
+                    error_type=ctx["error_type"],
+                    severity=ctx["severity"],
+                )},
+            ],
+            temperature=0.0,
+        )
+        content = _clean_json(r3.choices[0].message.content)
 
         try:
             raw_decision = json.loads(content)
         except json.JSONDecodeError:
-            print(f"[Agent 3] WARNING: JSON parse failed. Raw: {content[:120]}")
+            print(f"[Agent 3] WARNING: JSON parse failed on reflect step. Raw: {content[:120]}")
             raw_decision = None
 
         decision = _validate_decision(raw_decision, fallback)
 
     except Exception as exc:
-        # Infallibility: never crash pipeline on LLM errors (429/free quota, auth, network, etc.)
         print(f"[Agent 3] WARNING: LLM call failed ({exc}); using safe fallback decision.")
         decision = fallback
-
-
-
-
 
     print(
         f"[Agent 3] ✓ Action={decision.get('action')}  auto_execute={decision.get('auto_execute')}  confidence={decision.get('confidence')}"
     )
     return {"decision": decision, "status": "decided"}
-

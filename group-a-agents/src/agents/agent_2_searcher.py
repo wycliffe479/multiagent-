@@ -21,10 +21,53 @@ for _p in (_PROJECT_ROOT, _DB_DIR):
         sys.path.insert(0, _p)
 
 from openai import OpenAI
-from src.config import OPENCODE_API_KEY, OPENCODE_BASE_URL, MODEL_NAME
 from database.db_manager import search_past_incidents, get_solution_for_error
 
-llm = OpenAI(api_key=OPENCODE_API_KEY, base_url=OPENCODE_BASE_URL)
+def _get_llm():
+    from src.config import OPENCODE_API_KEY, OPENCODE_BASE_URL, MODEL_NAME
+    return OpenAI(api_key=OPENCODE_API_KEY, base_url=OPENCODE_BASE_URL), MODEL_NAME
+
+def _tavily_search(query: str) -> str:
+    """Search the web using Tavily and return a summary of results."""
+    try:
+        import requests
+        import os
+        from dotenv import load_dotenv
+        from pathlib import Path
+        # Walk up to find .env
+        current = Path(__file__).resolve().parent
+        for _ in range(8):
+            candidate = current / ".env"
+            if candidate.exists():
+                load_dotenv(candidate, override=True)
+                break
+            current = current.parent
+        tavily_key = os.getenv("TAVILY_API_KEY", "")
+        if not tavily_key:
+            return ""
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": tavily_key,
+                "query": query,
+                "max_results": 3,
+                "search_depth": "basic",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return ""
+        summary = "\n".join(
+            f"- {r.get('title', '')}: {r.get('content', '')[:200]}"
+            for r in results[:3]
+        )
+        return summary
+    except Exception as e:
+        return ""
 
 _SYSTEM = "You are an SRE expert. Suggest the single best remediation action."
 
@@ -123,10 +166,23 @@ def agent_2_search_past(state: dict) -> dict:
 
     else:
         # ------------------------------------------------------------------
-        # Step 2 — LLM fallback
+        # Step 2 — Tavily web search
         # ------------------------------------------------------------------
-        log("No database match. Asking LLM for recommendation …")
+        search_query = f"{error_type} server error remediation fix kubernetes ops"
+        log(f"No database match. Searching web for: {search_query!r}")
+        web_results = _tavily_search(search_query)
+        if web_results:
+            log(f"Web search returned results — feeding into LLM …")
+        else:
+            log(f"Web search returned no results — proceeding with LLM only …")
+
+        # ------------------------------------------------------------------
+        # Step 3 — LLM fallback (with web context if available)
+        # ------------------------------------------------------------------
+        log("Asking LLM for recommendation …")
+        web_context = f"\n\nWEB SEARCH RESULTS for '{error_type} fix':\n{web_results}" if web_results else ""
         try:
+            llm, MODEL_NAME = _get_llm()
             response = llm.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
@@ -136,7 +192,7 @@ def agent_2_search_past(state: dict) -> dict:
                         error_type=error_type,
                         severity=severity,
                         location=location,
-                    )},
+                    ) + web_context},
                 ],
                 temperature=0.1,
             )

@@ -17,10 +17,12 @@ sys.path.insert(0, _ROOT)
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.background import BackgroundTasks
+from datetime import datetime
 import uvicorn
 
 app = FastAPI(title="Anvil 2026 — Ops Alert Triage")
-
+webhook_events: list[dict] = []
 # ---------------------------------------------------------------------------
 # HTML frontend (single-file, no build step needed)
 # ---------------------------------------------------------------------------
@@ -233,7 +235,121 @@ document.getElementById('alertInput').value = PRESETS['server-down'];
 async def index():
     return HTMLResponse(HTML)
 
+@app.post("/webhook/alert")
+async def webhook_alert(request: Request, background_tasks: BackgroundTasks):
+    """
+    Inbound webhook endpoint — accepts alerts from external systems.
+    Supports PagerDuty, Datadog, Grafana, and plain JSON formats.
+    """
+    body = await request.json()
 
+    # --- Normalize different webhook formats into a raw_alert string ---
+
+    raw_alert = ""
+
+    # Plain format: {"alert": "..."}
+    if "alert" in body:
+        raw_alert = body["alert"]
+
+    # Datadog format: {"title": "...", "body": "...", "host": "..."}
+    elif "title" in body:
+        host     = body.get("host", "unknown")
+        title    = body.get("title", "")
+        text     = body.get("body", body.get("text", ""))
+        priority = body.get("priority", "normal")
+        severity = "critical" if priority == "emergency" else "warning"
+        raw_alert = f"ALERT: {title} on {host}. {text} Severity: {severity}."
+
+    # PagerDuty format: {"messages": [{"event": {"data": {...}}}]}
+    elif "messages" in body:
+        try:
+            data     = body["messages"][0]["event"]["data"]
+            service  = data.get("service", {}).get("name", "unknown")
+            summary  = data.get("summary", "")
+            severity = data.get("severity", "critical")
+            raw_alert = f"ALERT: {summary} on {service}. Severity: {severity}."
+        except Exception:
+            raw_alert = str(body)
+
+    # Grafana format: {"alerts": [{"labels": {...}, "annotations": {...}}]}
+    elif "alerts" in body:
+        try:
+            alert    = body["alerts"][0]
+            name     = alert.get("labels", {}).get("alertname", "unknown")
+            instance = alert.get("labels", {}).get("instance", "unknown")
+            summary  = alert.get("annotations", {}).get("summary", "")
+            severity = alert.get("labels", {}).get("severity", "critical")
+            raw_alert = f"ALERT: {name} on {instance}. {summary} Severity: {severity}."
+        except Exception:
+            raw_alert = str(body)
+
+    else:
+        raw_alert = str(body)
+
+    if not raw_alert.strip():
+        return JSONResponse({"error": "Could not parse webhook payload"}, status_code=400)
+
+    # Log the incoming webhook
+    event_id = f"wh-{int(datetime.now().timestamp())}"
+    webhook_events.append({
+        "id":         event_id,
+        "received_at": datetime.now().isoformat(),
+        "raw_alert":  raw_alert,
+        "status":     "running",
+        "result":     None,
+    })
+
+    print(f"[Webhook] Received event {event_id}: {raw_alert[:80]}")
+
+    # Fire pipeline in background — async, non-blocking
+    background_tasks.add_task(_run_webhook_pipeline, event_id, raw_alert)
+
+    return JSONResponse({
+        "status":    "accepted",
+        "event_id":  event_id,
+        "raw_alert": raw_alert,
+        "message":   "Pipeline triggered asynchronously",
+    })
+
+
+@app.get("/webhook/events")
+async def get_webhook_events():
+    """Returns all webhook-triggered pipeline runs."""
+    return JSONResponse({"events": webhook_events[-20:]})
+
+
+@app.get("/webhook/events/{event_id}")
+async def get_webhook_event(event_id: str):
+    """Poll for the result of a specific webhook-triggered run."""
+    for ev in webhook_events:
+        if ev["id"] == event_id:
+            return JSONResponse(ev)
+    return JSONResponse({"error": "Event not found"}, status_code=404)
+
+
+def _run_webhook_pipeline(event_id: str, raw_alert: str):
+    """Runs in background thread — updates webhook_events when done."""
+    try:
+        result = _invoke_pipeline(raw_alert)
+        for ev in webhook_events:
+            if ev["id"] == event_id:
+                ev["status"] = "completed"
+                ev["result"] = {
+                    "server":       result.get("parsed_alert", {}).get("server_name"),
+                    "error_type":   result.get("parsed_alert", {}).get("error_type"),
+                    "severity":     result.get("parsed_alert", {}).get("severity"),
+                    "action":       result.get("decision", {}).get("action"),
+                    "auto_execute": result.get("decision", {}).get("auto_execute"),
+                    "confidence":   result.get("decision", {}).get("confidence"),
+                    "slack_status": result.get("slack_status"),
+                }
+                break
+    except Exception as exc:
+        for ev in webhook_events:
+            if ev["id"] == event_id:
+                ev["status"] = "failed"
+                ev["error"]  = str(exc)
+                break
 @app.post("/run")
 async def run_pipeline(request: Request):
     body = await request.json()
